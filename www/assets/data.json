@@ -1,0 +1,7 @@
+{
+  "project": "Multi-threaded HTTP/1.0 web server",
+  "language": "Python",
+  "networking": "socket",
+  "concurrency": "threading",
+  "status": "ready"
+}

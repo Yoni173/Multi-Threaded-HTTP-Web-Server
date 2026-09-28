@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160" role="img" aria-labelledby="title desc">
+  <title id="title">Socket server logo</title>
+  <desc id="desc">A simple network node icon</desc>
+  <rect width="160" height="160" rx="24" fill="#0f766e"/>
+  <circle cx="80" cy="80" r="34" fill="#ffffff"/>
+  <circle cx="38" cy="42" r="13" fill="#ccfbf1"/>
+  <circle cx="122" cy="42" r="13" fill="#ccfbf1"/>
+  <circle cx="38" cy="118" r="13" fill="#ccfbf1"/>
+  <circle cx="122" cy="118" r="13" fill="#ccfbf1"/>
+  <path d="M50 48 L68 66 M110 48 L92 66 M50 112 L68 94 M110 112 L92 94" stroke="#ccfbf1" stroke-width="8" stroke-linecap="round"/>
+  <text x="80" y="88" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#0f766e">HTTP</text>
+</svg>

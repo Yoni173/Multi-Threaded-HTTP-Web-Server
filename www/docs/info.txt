@@ -1,0 +1,3 @@
+This is a plain text file served from the allowed docs directory.
+
+The server sends it with a Content-Type guessed by Python's mimetypes module.
