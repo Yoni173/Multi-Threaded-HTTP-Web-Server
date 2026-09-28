@@ -10,3 +10,4 @@ venv/
 # Editors
 .vscode/
 .idea/
+.pytest_cache/

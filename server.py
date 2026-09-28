@@ -1,14 +1,19 @@
+import argparse
+import logging
 import mimetypes
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote
 
 
-HOST = "127.0.0.1"
-PORT = 8080
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8080
+DEFAULT_WORKERS = 32
 MAX_HEADER_SIZE = 8192
 RECV_SIZE = 1024
+CLIENT_TIMEOUT_SECONDS = 10
 
 BASE_DIR = Path(__file__).parent.resolve()
 WWW_DIR = (BASE_DIR / "www").resolve()
@@ -20,8 +25,11 @@ STATUS_MESSAGES = {
     403: "Forbidden",
     404: "Not Found",
     405: "Method Not Allowed",
+    408: "Request Timeout",
     500: "Internal Server Error",
 }
+
+logger = logging.getLogger("webserver")
 
 
 class HTTPError(Exception):
@@ -42,7 +50,10 @@ def read_request_headers(client_socket):
     data = b""
 
     while b"\r\n\r\n" not in data:
-        chunk = client_socket.recv(RECV_SIZE)
+        try:
+            chunk = client_socket.recv(RECV_SIZE)
+        except socket.timeout:
+            raise HTTPError(408)
         if not chunk:
             break
 
@@ -164,16 +175,18 @@ def handle_client(client_socket, client_address):
     """
     Handle one client connection.
 
-    Each accepted connection runs in its own thread. The with-statement closes
-    the client socket after the response is sent.
+    Each accepted connection runs in its own thread (or in a pool worker). The
+    with-statement closes the client socket after the response is sent.
     """
     with client_socket:
-        client_socket.settimeout(10)
+        client_socket.settimeout(CLIENT_TIMEOUT_SECONDS)
+        client = f"{client_address[0]}:{client_address[1]}"
+        unread_input = False
 
         try:
             header_text = read_request_headers(client_socket)
             method, path, version = parse_request_line(header_text)
-            print(f"{client_address[0]}:{client_address[1]} {method} {path} {version}")
+            logger.info("%s %s %s %s", client, method, path, version)
 
             if method != "GET":
                 raise HTTPError(405)
@@ -182,42 +195,142 @@ def handle_client(client_socket, client_address):
             response = build_file_response(requested_file)
 
         except HTTPError as error:
+            logger.info("%s -> %s", client, error.status_code)
+            # 400 while reading headers may leave client data unread.
+            unread_input = error.status_code == 400
             response = build_error_response(error.status_code)
-        except Exception as error:
-            print(f"Internal server error for {client_address}: {error}")
+        except Exception:
+            logger.exception("Internal server error for %s", client)
             response = build_error_response(500)
 
-        client_socket.sendall(response)
+        try:
+            client_socket.sendall(response)
+            if unread_input:
+                drain_and_close(client_socket)
+        except OSError as error:
+            # The client disconnected before we could answer; nothing to do.
+            logger.warning("Could not send response to %s: %s", client, error)
 
 
-def run_server():
-    """Create the listening TCP socket and accept clients forever."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+def drain_and_close(client_socket, max_bytes=65536):
+    """
+    Graceful close after rejecting a request we did not fully read.
 
-        # bind() chooses the local IP address and port for this server process.
-        server_socket.bind((HOST, PORT))
+    If a socket is closed while unread data is still in its receive buffer, the
+    OS sends a TCP RST, and the client may lose our error response. Shutting
+    down the write side first and briefly draining the input avoids that.
+    """
+    client_socket.shutdown(socket.SHUT_WR)
+    client_socket.settimeout(1)
+    received = 0
+    try:
+        while received < max_bytes:
+            chunk = client_socket.recv(RECV_SIZE)
+            if not chunk:
+                break
+            received += len(chunk)
+    except OSError:
+        pass
 
-        # listen() marks the socket as a passive socket that can accept clients.
-        server_socket.listen()
-        print(f"Serving http://{HOST}:{PORT}/ from {WWW_DIR}")
-        print("Press Ctrl+C to stop the server.")
 
-        while True:
-            # accept() waits for a new TCP connection and returns a new socket
-            # used only for that client.
-            client_socket, client_address = server_socket.accept()
+def create_server_socket(host=DEFAULT_HOST, port=DEFAULT_PORT):
+    """Create a TCP socket, bind it to (host, port) and start listening."""
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-            thread = threading.Thread(
-                target=handle_client,
-                args=(client_socket, client_address),
-                daemon=True,
-            )
-            thread.start()
+    # bind() chooses the local IP address and port for this server process.
+    server_socket.bind((host, port))
+
+    # listen() marks the socket as a passive socket that can accept clients.
+    server_socket.listen()
+    return server_socket
+
+
+def serve_forever(server_socket, mode="thread", workers=DEFAULT_WORKERS, stop_event=None):
+    """
+    Accept clients until stop_event is set (or the listening socket is closed).
+
+    mode="thread": spawn a new thread per connection (unbounded concurrency).
+    mode="pool":   hand connections to a fixed-size pool of worker threads, so
+                   a flood of connections cannot create unlimited threads.
+    """
+    executor = ThreadPoolExecutor(max_workers=workers) if mode == "pool" else None
+    stop_event = stop_event or threading.Event()
+
+    # A short accept() timeout lets the loop notice stop_event and lets Ctrl+C
+    # interrupt the server promptly on every OS (a blocking accept() may not).
+    server_socket.settimeout(0.5)
+
+    try:
+        while not stop_event.is_set():
+            try:
+                # accept() waits for a new TCP connection and returns a new
+                # socket used only for that client.
+                client_socket, client_address = server_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                # The listening socket was closed: shut down cleanly.
+                break
+
+            if executor is not None:
+                executor.submit(handle_client, client_socket, client_address)
+            else:
+                thread = threading.Thread(
+                    target=handle_client,
+                    args=(client_socket, client_address),
+                    daemon=True,
+                )
+                thread.start()
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Multi-threaded static HTTP/1.0 web server built on raw TCP sockets."
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help="address to bind (default: %(default)s)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="port to listen on (default: %(default)s)")
+    parser.add_argument(
+        "--mode",
+        choices=["thread", "pool"],
+        default="thread",
+        help="concurrency model: new thread per connection, or a fixed thread pool (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="number of worker threads in pool mode (default: %(default)s)",
+    )
+    parser.add_argument("--quiet", action="store_true", help="only log warnings and errors")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=logging.WARNING if args.quiet else logging.INFO,
+        format="%(asctime)s [%(threadName)s] %(message)s",
+    )
+
+    with create_server_socket(args.host, args.port) as server_socket:
+        logger.warning(
+            "Serving http://%s:%s/ from %s (mode=%s%s)",
+            args.host,
+            args.port,
+            WWW_DIR,
+            args.mode,
+            f", workers={args.workers}" if args.mode == "pool" else "",
+        )
+        logger.warning("Press Ctrl+C to stop the server.")
+        serve_forever(server_socket, args.mode, args.workers)
 
 
 if __name__ == "__main__":
     try:
-        run_server()
+        main()
     except KeyboardInterrupt:
         print("\nServer stopped.")
